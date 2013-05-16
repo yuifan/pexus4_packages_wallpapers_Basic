@@ -17,22 +17,15 @@
 package com.android.wallpaper.fall;
 
 import android.os.Bundle;
-import android.renderscript.Element;
-import android.renderscript.ScriptC;
-import android.renderscript.ProgramFragment;
-import android.renderscript.ProgramStore;
-import android.renderscript.ProgramVertex;
-import android.renderscript.Allocation;
-import android.renderscript.Sampler;
-import android.renderscript.Type;
-import android.renderscript.SimpleMesh;
-import android.renderscript.Script;
+import android.renderscript.*;
 import static android.renderscript.Sampler.Value.LINEAR;
 import static android.renderscript.Sampler.Value.CLAMP;
 import static android.renderscript.ProgramStore.DepthFunc.*;
 import static android.renderscript.ProgramStore.BlendDstFunc;
 import static android.renderscript.ProgramStore.BlendSrcFunc;
 import static android.renderscript.Element.*;
+
+import android.util.Log;
 
 import android.app.WallpaperManager;
 import android.graphics.BitmapFactory;
@@ -69,22 +62,21 @@ class FallRS extends RenderScriptScene {
     private ProgramVertex mPvSky;
     @SuppressWarnings({"FieldCanBeLocal"})
     private ProgramVertex mPvWater;
-    private ProgramVertex.MatrixAllocation mPvOrthoAlloc;
+    private ProgramVertexFixedFunction.Constants mPvOrthoAlloc;
     @SuppressWarnings({"FieldCanBeLocal"})
     private Sampler mSampler;
 
-    private Allocation mState;
-    private Allocation mDropState;
-    private DropState mDrop;
-    private Type mStateType;
-    private Type mDropType;
     private int mMeshWidth;
     private Allocation mUniformAlloc;
 
     private int mMeshHeight;
     @SuppressWarnings({"FieldCanBeLocal"})
-    private SimpleMesh mMesh;
+    private Mesh mMesh;
     private WorldState mWorldState;
+
+    private ScriptC_fall mScript;
+
+    private ScriptField_Constants mConstants;
 
     private float mGlHeight;
 
@@ -98,15 +90,15 @@ class FallRS extends RenderScriptScene {
     @Override
     public void setOffset(float xOffset, float yOffset, int xPixels, int yPixels) {
         mWorldState.xOffset = xOffset;
-        mState.data(mWorldState);
+        mScript.set_g_xOffset(mWorldState.xOffset);
     }
 
     @Override
     public Bundle onCommand(String action, int x, int y, int z, Bundle extras,
             boolean resultRequested) {
-        if (WallpaperManager.COMMAND_TAP.equals(action)) {
-            addDrop(x + (mWorldState.rotate == 0 ? (mWorldState.width * mWorldState.xOffset) : 0), y);
-        } else if (WallpaperManager.COMMAND_DROP.equals(action)) {
+        if (WallpaperManager.COMMAND_TAP.equals(action)
+                || WallpaperManager.COMMAND_SECONDARY_TAP.equals(action)
+                || WallpaperManager.COMMAND_DROP.equals(action)) {
             addDrop(x + (mWorldState.rotate == 0 ? (mWorldState.width * mWorldState.xOffset) : 0), y);
         }
         return null;
@@ -129,13 +121,22 @@ class FallRS extends RenderScriptScene {
         mWorldState.width = width;
         mWorldState.height = height;
         mWorldState.rotate = width > height ? 1 : 0;
-        mState.data(mWorldState);
 
-        mPvOrthoAlloc.setupProjectionNormalized(mWidth, mHeight);
+        mScript.set_g_glWidth(mWorldState.width);
+        mScript.set_g_glHeight(mWorldState.height);
+        mScript.set_g_rotate(mWorldState.rotate);
+
+        mScript.invoke_initLeaves();
+
+        Matrix4f proj = new Matrix4f();
+        proj.loadProjectionNormalized(mWidth, mHeight);
+        mPvOrthoAlloc.setProjection(proj);
     }
 
     @Override
     protected ScriptC createScript() {
+        mScript = new ScriptC_fall(mRS, mResources, R.raw.fall);
+
         createMesh();
         createState();
         createProgramVertex();
@@ -143,29 +144,15 @@ class FallRS extends RenderScriptScene {
         createProgramFragment();
         loadTextures();
 
-        ScriptC.Builder sb = new ScriptC.Builder(mRS);
-        sb.setType(mStateType, "State", RSID_STATE);
-        sb.setType(mDropType, "Drop", RSID_DROP);
-        sb.setType(mUniformAlloc.getType(), "Constants", RSID_CONSTANTS);
-        sb.setScript(mResources, R.raw.fall);
-        Script.Invokable invokable = sb.addInvokable("initLeaves");
-        sb.setRoot(true);
+        mScript.setTimeZone(TimeZone.getDefault().getID());
 
-        ScriptC script = sb.create();
-        script.setClearColor(0.0f, 0.0f, 0.0f, 1.0f);
-        script.setTimeZone(TimeZone.getDefault().getID());
+        mScript.bind_g_Constants(mConstants);
 
-        script.bindAllocation(mState, RSID_STATE);
-        script.bindAllocation(mUniformAlloc, RSID_CONSTANTS);
-        script.bindAllocation(mDropState, RSID_DROP);
-
-        invokable.execute();
-
-        return script;
+        return mScript;
     }
 
     private void createMesh() {
-        SimpleMesh.TriangleMeshBuilder tmb = new SimpleMesh.TriangleMeshBuilder(mRS, 2, 0);
+        Mesh.TriangleMeshBuilder tmb = new Mesh.TriangleMeshBuilder(mRS, 2, 0);
 
         final int width = mWidth > mHeight ? mHeight : mWidth;
         final int height = mWidth > mHeight ? mWidth : mHeight;
@@ -201,11 +188,12 @@ class FallRS extends RenderScriptScene {
             }
         }
 
-        mMesh = tmb.create();
-        mMesh.setName("WaterMesh");
+        mMesh = tmb.create(true);
 
         mMeshWidth = wResolution + 1;
         mMeshHeight = hResolution + 1;
+
+        mScript.set_g_WaterMesh(mMesh);
     }
 
     static class WorldState {
@@ -224,11 +212,6 @@ class FallRS extends RenderScriptScene {
         public float xOffset;
     }
 
-    static class DropState {
-        public int dropX;
-        public int dropY;
-    }
-
     private void createState() {
         mWorldState = new WorldState();
         mWorldState.width = mWidth;
@@ -243,115 +226,96 @@ class FallRS extends RenderScriptScene {
         mWorldState.rotate = mWidth > mHeight ? 1 : 0;
         mWorldState.isPreview = isPreview() ? 1 : 0;
 
-        mStateType = Type.createFromClass(mRS, WorldState.class, 1, "WorldState");
-        mState = Allocation.createTyped(mRS, mStateType);
-        mState.data(mWorldState);
-
-        mDrop = new DropState();
-        mDrop.dropX = -1;
-        mDrop.dropY = -1;
-
-        mDropType = Type.createFromClass(mRS, DropState.class, 1, "DropState");
-        mDropState = Allocation.createTyped(mRS, mDropType);
-        mDropState.data(mDrop);
+        mScript.set_g_glWidth(mWorldState.glWidth);
+        mScript.set_g_glHeight(mWorldState.glHeight);
+        mScript.set_g_meshWidth(mWorldState.meshWidth);
+        mScript.set_g_meshHeight(mWorldState.meshHeight);
+        mScript.set_g_xOffset(0);
+        mScript.set_g_rotate(mWorldState.rotate);
     }
 
     private void loadTextures() {
-        final Allocation[] textures = new Allocation[TEXTURES_COUNT];
-        textures[RSID_TEXTURE_RIVERBED] = loadTexture(R.drawable.pond, "TRiverbed");
-        textures[RSID_TEXTURE_LEAVES] = loadTextureARGB(R.drawable.leaves, "TLeaves");
-
-        final int count = textures.length;
-        for (int i = 0; i < count; i++) {
-            textures[i].uploadToTexture(0);
-        }
+        mScript.set_g_TLeaves(loadTextureARGB(R.drawable.leaves));
+        mScript.set_g_TRiverbed(loadTexture(R.drawable.pond));
     }
 
-    private Allocation loadTexture(int id, String name) {
-        final Allocation allocation = Allocation.createFromBitmapResource(mRS, mResources,
-                id, RGB_565(mRS), false);
-        allocation.setName(name);
+    private Allocation loadTexture(int id) {
+        final Allocation allocation = Allocation.createFromBitmapResource(mRS, mResources, id);
         return allocation;
     }
 
-    private Allocation loadTextureARGB(int id, String name) {
+    private Allocation loadTextureARGB(int id) {
         Bitmap b = BitmapFactory.decodeResource(mResources, id, mOptionsARGB);
-        final Allocation allocation = Allocation.createFromBitmap(mRS, b, RGBA_8888(mRS), false);
-        allocation.setName(name);
+        final Allocation allocation = Allocation.createFromBitmap(mRS, b);
         return allocation;
     }
 
     private void createProgramFragment() {
         Sampler.Builder sampleBuilder = new Sampler.Builder(mRS);
-        sampleBuilder.setMin(LINEAR);
-        sampleBuilder.setMag(LINEAR);
+        sampleBuilder.setMinification(LINEAR);
+        sampleBuilder.setMagnification(LINEAR);
         sampleBuilder.setWrapS(CLAMP);
         sampleBuilder.setWrapT(CLAMP);
         mSampler = sampleBuilder.create();
 
-        ProgramFragment.Builder builder = new ProgramFragment.Builder(mRS);
-        builder.setTexture(ProgramFragment.Builder.EnvMode.REPLACE,
-                           ProgramFragment.Builder.Format.RGBA, 0);
+        ProgramFragmentFixedFunction.Builder builder = new ProgramFragmentFixedFunction.Builder(mRS);
+        builder.setTexture(ProgramFragmentFixedFunction.Builder.EnvMode.REPLACE,
+                           ProgramFragmentFixedFunction.Builder.Format.RGBA, 0);
         mPfBackground = builder.create();
-        mPfBackground.setName("PFBackground");
         mPfBackground.bindSampler(mSampler, 0);
 
-        builder = new ProgramFragment.Builder(mRS);
-        builder.setTexture(ProgramFragment.Builder.EnvMode.MODULATE,
-                           ProgramFragment.Builder.Format.RGBA, 0);
+        mScript.set_g_PFBackground(mPfBackground);
+
+        builder = new ProgramFragmentFixedFunction.Builder(mRS);
+        builder.setTexture(ProgramFragmentFixedFunction.Builder.EnvMode.MODULATE,
+                           ProgramFragmentFixedFunction.Builder.Format.RGBA, 0);
         mPfSky = builder.create();
-        mPfSky.setName("PFSky");
         mPfSky.bindSampler(mSampler, 0);
+
+        mScript.set_g_PFSky(mPfSky);
     }
 
     private void createProgramFragmentStore() {
-        ProgramStore.Builder builder = new ProgramStore.Builder(mRS, null, null);
+        ProgramStore.Builder builder = new ProgramStore.Builder(mRS);
         builder.setDepthFunc(ALWAYS);
         builder.setBlendFunc(BlendSrcFunc.ONE, BlendDstFunc.ONE);
-        builder.setDitherEnable(false);
-        builder.setDepthMask(true);
+        builder.setDitherEnabled(false);
+        builder.setDepthMaskEnabled(true);
         mPfsBackground = builder.create();
-        mPfsBackground.setName("PFSBackground");
 
-        builder = new ProgramStore.Builder(mRS, null, null);
+        builder = new ProgramStore.Builder(mRS);
         builder.setDepthFunc(ALWAYS);
         builder.setBlendFunc(BlendSrcFunc.SRC_ALPHA, BlendDstFunc.ONE_MINUS_SRC_ALPHA);
-        builder.setDitherEnable(false);
-        builder.setDepthMask(true);
+        builder.setDitherEnabled(false);
+        builder.setDepthMaskEnabled(true);
         mPfsLeaf = builder.create();
-        mPfsLeaf.setName("PFSLeaf");
+
+        mScript.set_g_PFSLeaf(mPfsLeaf);
+        mScript.set_g_PFSBackground(mPfsBackground);
     }
 
     private void createProgramVertex() {
-        mPvOrthoAlloc = new ProgramVertex.MatrixAllocation(mRS);
-        mPvOrthoAlloc.setupProjectionNormalized(mWidth, mHeight);
+        mPvOrthoAlloc = new ProgramVertexFixedFunction.Constants(mRS);
+        Matrix4f proj = new Matrix4f();
+        proj.loadProjectionNormalized(mWidth, mHeight);
+        mPvOrthoAlloc.setProjection(proj);
 
-        ProgramVertex.Builder builder = new ProgramVertex.Builder(mRS, null, null);
+
+        ProgramVertexFixedFunction.Builder builder = new ProgramVertexFixedFunction.Builder(mRS);
         mPvSky = builder.create();
-        mPvSky.bindAllocation(mPvOrthoAlloc);
-        mPvSky.setName("PVSky");
+        ((ProgramVertexFixedFunction)mPvSky).bindConstants(mPvOrthoAlloc);
 
-        Element.Builder eb = new Element.Builder(mRS);
-        // Make this an array when we can.
-        eb.add(Element.createVector(mRS, Element.DataType.FLOAT_32, 4), "Drop01");
-        eb.add(Element.createVector(mRS, Element.DataType.FLOAT_32, 4), "Drop02");
-        eb.add(Element.createVector(mRS, Element.DataType.FLOAT_32, 4), "Drop03");
-        eb.add(Element.createVector(mRS, Element.DataType.FLOAT_32, 4), "Drop04");
-        eb.add(Element.createVector(mRS, Element.DataType.FLOAT_32, 4), "Drop05");
-        eb.add(Element.createVector(mRS, Element.DataType.FLOAT_32, 4), "Drop06");
-        eb.add(Element.createVector(mRS, Element.DataType.FLOAT_32, 4), "Drop07");
-        eb.add(Element.createVector(mRS, Element.DataType.FLOAT_32, 4), "Drop08");
-        eb.add(Element.createVector(mRS, Element.DataType.FLOAT_32, 4), "Drop09");
-        eb.add(Element.createVector(mRS, Element.DataType.FLOAT_32, 4), "Drop10");
-        eb.add(Element.createVector(mRS, Element.DataType.FLOAT_32, 4), "Offset");
-        eb.add(Element.USER_F32(mRS), "Rotate");
-        Element e = eb.create();
+        mScript.set_g_PVSky(mPvSky);
 
-        mUniformAlloc = Allocation.createSized(mRS, e, 1);
+        mConstants = new ScriptField_Constants(mRS, 1);
+        mUniformAlloc = mConstants.getAllocation();
 
-        ProgramVertex.ShaderBuilder sb = new ProgramVertex.ShaderBuilder(mRS);
+        ProgramVertex.Builder sb = new ProgramVertex.Builder(mRS);
 
         String t = "\n" +
+                "varying vec4 varColor;\n" +
+                "varying vec2 varTex0;\n" +
+
                 "vec2 addDrop(vec4 d, vec2 pos, float dxMul) {\n" +
                 "  vec2 ret = vec2(0.0, 0.0);\n" +
                 "  vec2 delta = d.xy - pos;\n" +
@@ -371,7 +335,7 @@ class FallRS extends RenderScriptScene {
                 "  gl_Position = vec4(pos.x, pos.y, 0.0, 1.0);\n" +
                 "  float dxMul = 1.0;\n" +
 
-                "  varTex0 = vec4((pos.x + 1.0), (pos.y + 1.6666), 0.0, 0.0);\n" +
+                "  varTex0 = vec2((pos.x + 1.0), (pos.y + 1.6666));\n" +
 
                 "  if (UNI_Rotate < 0.9) {\n" +
                 "    varTex0.xy *= vec2(0.25, 0.33);\n" +
@@ -397,19 +361,21 @@ class FallRS extends RenderScriptScene {
                 "  varTex0.xy += addDrop(UNI_Drop09, pos, dxMul);\n" +
                 "  varTex0.xy += addDrop(UNI_Drop10, pos, dxMul);\n" +
                 "}\n";
+
         sb.setShader(t);
         sb.addConstant(mUniformAlloc.getType());
-        sb.addInput(mMesh.getVertexType(0).getElement());
+        sb.addInput(mMesh.getVertexAllocation(0).getType().getElement());
         mPvWater = sb.create();
-        mPvWater.bindAllocation(mPvOrthoAlloc);
-        mPvWater.setName("PVWater");
-        mPvWater.bindConstants(mUniformAlloc, 1);
+        mPvWater.bindConstants(mUniformAlloc, 0);
+
+        mScript.set_g_PVWater(mPvWater);
 
     }
 
     void addDrop(float x, float y) {
-        mDrop.dropX = (int) ((x / mWidth) * mMeshWidth);
-        mDrop.dropY = (int) ((y / mHeight) * mMeshHeight);
-        mDropState.data(mDrop);
+        int dropX = (int) ((x / mWidth) * mMeshWidth);
+        int dropY = (int) ((y / mHeight) * mMeshHeight);
+
+        mScript.invoke_addDrop(dropX, dropY);
     }
 }

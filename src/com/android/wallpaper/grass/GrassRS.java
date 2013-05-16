@@ -20,18 +20,10 @@ import android.renderscript.Sampler;
 import static android.renderscript.ProgramStore.DepthFunc.*;
 import static android.renderscript.ProgramStore.BlendSrcFunc;
 import static android.renderscript.ProgramStore.BlendDstFunc;
-import android.renderscript.ProgramFragment;
-import android.renderscript.ProgramStore;
-import android.renderscript.Allocation;
-import android.renderscript.ProgramVertex;
+import android.renderscript.*;
 import static android.renderscript.Element.*;
 import static android.util.MathUtils.*;
-import android.renderscript.ScriptC;
-import android.renderscript.Type;
-import android.renderscript.Dimension;
-import android.renderscript.Element;
-import android.renderscript.SimpleMesh;
-import android.renderscript.Primitive;
+import android.renderscript.Mesh.Primitive;
 import static android.renderscript.Sampler.Value.*;
 import android.content.Context;
 import android.content.IntentFilter;
@@ -55,64 +47,23 @@ class GrassRS extends RenderScriptScene {
 
     private static final int LOCATION_UPDATE_MIN_TIME = DEBUG ? 5 * 60 * 1000 : 60 * 60 * 1000; // 1 hour
     private static final int LOCATION_UPDATE_MIN_DISTANCE = DEBUG ? 10 : 150 * 1000; // 150 km
-
     private static final float TESSELATION = 0.5f;
     private static final int TEXTURES_COUNT = 5;
-
-    private static final int RSID_STATE = 0;
-    private static final int RSID_BLADES = 1;
     private static final int BLADES_COUNT = 200;
 
-    class BladesStruct {
-        public float angle;
-        public int size;
-        public float xPos;
-        public float yPos;
-        public float offset;
-        public float scale;
-        public float lengthX;
-        public float lengthY;
-        public float hardness;
-        public float h;
-        public float s;
-        public float b;
-        public float turbulencex;
-    };
+    private ScriptField_Blade mBlades;
+    private ScriptField_Vertex mVertexBuffer;
+    private ProgramVertexFixedFunction.Constants mPvOrthoAlloc;
 
-    private static final int RSID_BLADES_BUFFER = 2;
-
-    private ScriptC.Invokable mUpdateBladesInvokable;
-    @SuppressWarnings({ "FieldCanBeLocal" })
-    private ProgramFragment mPfBackground;
-    @SuppressWarnings({ "FieldCanBeLocal" })
-    private ProgramFragment mPfGrass;
-    @SuppressWarnings({ "FieldCanBeLocal" })
-    private ProgramStore mPfsBackground;
-    @SuppressWarnings({ "FieldCanBeLocal" })
-    private ProgramVertex mPvBackground;
-    @SuppressWarnings({"FieldCanBeLocal"})
-    private ProgramVertex.MatrixAllocation mPvOrthoAlloc;
-
-    @SuppressWarnings({ "FieldCanBeLocal" })
-    private Allocation[] mTextures;
-
-    private Type mStateType;
-    private Allocation mState;
-
-    private Type mBladesType;
-    private Allocation mBlades;
-    private Allocation mBladesBuffer;
+    //private Allocation mBladesBuffer;
     private Allocation mBladesIndicies;
-    @SuppressWarnings({"FieldCanBeLocal"})
-    private SimpleMesh mBladesMesh;
+    private Mesh mBladesMesh;
 
+    private ScriptC_grass mScript;
 
     private int mVerticies;
     private int mIndicies;
     private int[] mBladeSizes;
-    private final float[] mFloatData5 = new float[5];
-
-    private WorldState mWorldState;
 
     private final Context mContext;
     private final LocationManager mLocationManager;
@@ -144,8 +95,14 @@ class GrassRS extends RenderScriptScene {
 
         if (mLocationUpdater == null) {
             mLocationUpdater = new LocationUpdater();
-            mLocationManager.requestLocationUpdates(LocationManager.NETWORK_PROVIDER,
-                    LOCATION_UPDATE_MIN_TIME, LOCATION_UPDATE_MIN_DISTANCE, mLocationUpdater);
+            try {
+              mLocationManager.requestLocationUpdates(LocationManager.NETWORK_PROVIDER,
+                      LOCATION_UPDATE_MIN_TIME, LOCATION_UPDATE_MIN_DISTANCE, mLocationUpdater);
+            } catch (java.lang.IllegalArgumentException e) {
+              if (!e.getMessage().equals("provider=network")) {
+                throw e;
+              }
+            }
         }
 
         updateLocation();
@@ -170,140 +127,84 @@ class GrassRS extends RenderScriptScene {
     public void resize(int width, int height) {
         super.resize(width, height);
 
-        mWorldState.width = width;
-        mWorldState.height = height;
-        mState.data(mWorldState);
-
-        mUpdateBladesInvokable.execute();
-        mPvOrthoAlloc.setupOrthoWindow(width, height);
+        mScript.set_gWidth(width);
+        mScript.set_gHeight(height);
+        mScript.invoke_updateBlades();
+        Matrix4f proj = new Matrix4f();
+        proj.loadOrthoWindow(width, height);
+        mPvOrthoAlloc.setProjection(proj);
     }
 
     @Override
     protected ScriptC createScript() {
+        mScript = new ScriptC_grass(mRS, mResources, R.raw.grass);
+
+        final boolean isPreview = isPreview();
         createProgramVertex();
         createProgramFragmentStore();
         loadTextures();
         createProgramFragment();
-        createScriptStructures();
-
-        ScriptC.Builder sb = new ScriptC.Builder(mRS);
-        sb.setType(mStateType, "State", RSID_STATE);
-        sb.setType(mBladesType, "Blades", RSID_BLADES);
-        sb.setScript(mResources, R.raw.grass);
-        sb.setRoot(true);
-        mUpdateBladesInvokable = sb.addInvokable("updateBlades");
-
-        ScriptC script = sb.create();
-        script.setClearColor(0.0f, 0.0f, 0.0f, 1.0f);
-        script.setTimeZone(TimeZone.getDefault().getID());
-
-        script.bindAllocation(mState, RSID_STATE);
-        script.bindAllocation(mBlades, RSID_BLADES);
-        script.bindAllocation(mBladesBuffer, RSID_BLADES_BUFFER);
-
-        return script;
-    }
-
-    private void createScriptStructures() {
         createBlades();
-        createState();
+
+        mScript.set_gBladesCount(BLADES_COUNT);
+        mScript.set_gIndexCount(mIndicies);
+        mScript.set_gWidth(mWidth);
+        mScript.set_gHeight(mHeight);
+        mScript.set_gXOffset(isPreview ? 0.5f : 0.f);
+        mScript.set_gIsPreview(isPreview ? 1 : 0);
+        mScript.set_gBladesMesh(mBladesMesh);
+
+        mScript.setTimeZone(TimeZone.getDefault().getID());
+        mScript.bind_Blades(mBlades);
+        mScript.bind_Verticies(mVertexBuffer);
+
+        // set these to reasonable defaults.
+        mScript.set_gDawn(6.f / 24.f);
+        mScript.set_gDusk(18.f / 24.f);
+        mScript.set_gMorning(8.f / 24.f); // 2 hours for sunrise
+        mScript.set_gAfternoon(16.f / 24.f); // 2 hours for sunset
+
+        return mScript;
     }
 
     @Override
     public void setOffset(float xOffset, float yOffset, int xPixels, int yPixels) {
-        mWorldState.xOffset = xOffset;
-        mState.data(mWorldState);
-    }
-
-    static class WorldState {
-        public int bladesCount;
-        public int indexCount;
-        public int width;
-        public int height;
-        public float xOffset;
-        public float dawn;
-        public float morning;
-        public float afternoon;
-        public float dusk;
-        public int isPreview;
-    }
-
-    private void createState() {
-        final boolean isPreview = isPreview();
-
-        mWorldState = new WorldState();
-        mWorldState.width = mWidth;
-        mWorldState.height = mHeight;
-        mWorldState.bladesCount = BLADES_COUNT;
-        mWorldState.indexCount = mIndicies;
-        mWorldState.isPreview = isPreview ? 1 : 0;
-        if (isPreview) {
-            mWorldState.xOffset = 0.5f;
-        }
-
-        mStateType = Type.createFromClass(mRS, WorldState.class, 1, "WorldState");
-        mState = Allocation.createTyped(mRS, mStateType);
-        mState.data(mWorldState);
+        mScript.set_gXOffset(xOffset);
     }
 
     private void createBlades() {
         mVerticies = 0;
         mIndicies = 0;
 
-        mBladesType = Type.createFromClass(mRS, BladesStruct.class, BLADES_COUNT, "Blade");
-        mBlades = Allocation.createTyped(mRS, mBladesType);
-        BladesStruct bs = new BladesStruct();
+        mBlades = new ScriptField_Blade(mRS, BLADES_COUNT);
 
         mBladeSizes = new int[BLADES_COUNT];
         for (int i = 0; i < BLADES_COUNT; i++) {
-            createBlade(bs);
-            mIndicies += bs.size * 2 * 3;
-            mVerticies += bs.size + 2;
-            mBlades.subData(i, bs);
-            mBladeSizes[i] = bs.size;
+            ScriptField_Blade.Item item = new ScriptField_Blade.Item();
+            createBlade(item);
+            mBlades.set(item, i, false);
+
+            mIndicies += item.size * 2 * 3;
+            mVerticies += item.size + 2;
+            mBladeSizes[i] = item.size;
         }
+        mBlades.copyAll();
 
         createMesh();
     }
 
     private void createMesh() {
-        Builder elementBuilder = new Builder(mRS);
-        elementBuilder.add(Element.ATTRIB_COLOR_U8_4(mRS), "color");
-        elementBuilder.add(Element.ATTRIB_POSITION_2(mRS), "position");
-        elementBuilder.add(Element.ATTRIB_TEXTURE_2(mRS), "texture");
-        final Element vertexElement = elementBuilder.create();
+        mVertexBuffer = new ScriptField_Vertex(mRS, mVerticies * 2);
 
-        final SimpleMesh.Builder meshBuilder = new SimpleMesh.Builder(mRS);
-        final int vertexSlot = meshBuilder.addVertexType(vertexElement, mVerticies  * 2);
-        meshBuilder.setIndexType(Element.INDEX_16(mRS), mIndicies);
-        meshBuilder.setPrimitive(Primitive.TRIANGLE);
+        final Mesh.AllocationBuilder meshBuilder = new Mesh.AllocationBuilder(mRS);
+        meshBuilder.addVertexAllocation(mVertexBuffer.getAllocation());
+
+        mBladesIndicies = Allocation.createSized(mRS, Element.U16(mRS), mIndicies);
+        meshBuilder.addIndexSetAllocation(mBladesIndicies, Primitive.TRIANGLE);
+
         mBladesMesh = meshBuilder.create();
-        mBladesMesh.setName("BladesMesh");
-
-        mBladesBuffer = mBladesMesh.createVertexAllocation(vertexSlot);
-        mBladesBuffer.setName("BladesBuffer");
-        mBladesMesh.bindVertexAllocation(mBladesBuffer, 0);
-        mBladesIndicies = mBladesMesh.createIndexAllocation();
-        mBladesMesh.bindIndexAllocation(mBladesIndicies);
-
-        // Assign the texture coordinates of each triangle
-        final float[] floatData = mFloatData5;
-        final Allocation buffer = mBladesBuffer;
 
         short[] idx = new short[mIndicies];
-
-        int bufferIndex = 0;
-        int i2 = 0;
-        for (int i = 0; i < mVerticies; i +=2) {
-            floatData[3] = 0.0f;
-            floatData[4] = 0.0f;
-            buffer.subData1D(bufferIndex++, 1, floatData);
-
-            floatData[3] = 1.0f;
-            floatData[4] = 0.0f;
-            buffer.subData1D(bufferIndex++, 1, floatData);
-        }
-
         int idxIdx = 0;
         int vtxIdx = 0;
         for (int i = 0; i < mBladeSizes.length; i++) {
@@ -320,11 +221,10 @@ class GrassRS extends RenderScriptScene {
             vtxIdx += 2;
         }
 
-        mBladesIndicies.data(idx);
-        mBladesIndicies.uploadToBufferObject();
+        mBladesIndicies.copyFrom(idx);
     }
 
-    private void createBlade(BladesStruct blades) {
+    private void createBlade(ScriptField_Blade.Item blades) {
         final float size = random(4.0f) + 4.0f;
         final int xpos = random(-mWidth, mWidth);
 
@@ -345,95 +245,87 @@ class GrassRS extends RenderScriptScene {
     }
 
     private void loadTextures() {
-        mTextures = new Allocation[TEXTURES_COUNT];
-
-        final Allocation[] textures = mTextures;
-        textures[0] = loadTexture(R.drawable.night, "TNight");
-        textures[1] = loadTexture(R.drawable.sunrise, "TSunrise");
-        textures[2] = loadTexture(R.drawable.sky, "TSky");
-        textures[3] = loadTexture(R.drawable.sunset, "TSunset");
-        textures[4] = generateTextureAlpha(4, 1, new int[] { 0x00FFFF00 }, "TAa");
-
-        final int count = textures.length;
-        for (int i = 0; i < count; i++) {
-            textures[i].uploadToTexture(0);
-        }
+        mScript.set_gTNight(loadTexture(R.drawable.night));
+        mScript.set_gTSunrise(loadTexture(R.drawable.sunrise));
+        mScript.set_gTSky(loadTexture(R.drawable.sky));
+        mScript.set_gTSunset(loadTexture(R.drawable.sunset));
+        mScript.set_gTAa(generateTextureAlpha());
     }
 
-    private Allocation generateTextureAlpha(int width, int height, int[] data, String name) {
+    private Allocation generateTextureAlpha() {
         final Type.Builder builder = new Type.Builder(mRS, A_8(mRS));
-        builder.add(Dimension.X, width);
-        builder.add(Dimension.Y, height);
-        builder.add(Dimension.LOD, 1);
+        builder.setX(4);
+        builder.setY(1);
+        builder.setMipmaps(true);
 
-        final Allocation allocation = Allocation.createTyped(mRS, builder.create());
-        allocation.setName(name);
+        final Allocation allocation = Allocation.createTyped(mRS, builder.create(),
+                                                             Allocation.USAGE_GRAPHICS_TEXTURE);
+        byte[] mip0 = new byte[] {0, -1, -1, 0};
+        byte[] mip1 = new byte[] {64, 64};
+        byte[] mip2 = new byte[] {0};
 
-        int[] grey1 = new int[] {0x3f3f3f3f};
-        int[] grey2 = new int[] {0x00000000};
-        Allocation.Adapter2D a = allocation.createAdapter2D();
-        a.setConstraint(Dimension.LOD, 0);
-        a.subData(0, 0, 4, 1, data);
-        a.setConstraint(Dimension.LOD, 1);
-        a.subData(0, 0, 2, 1, grey1);
-        a.setConstraint(Dimension.LOD, 2);
-        a.subData(0, 0, 1, 1, grey2);
+        AllocationAdapter a = AllocationAdapter.create2D(mRS, allocation);
+        a.setLOD(0);
+        a.copyFrom(mip0);
+        a.setLOD(1);
+        a.copyFrom(mip1);
+        a.setLOD(2);
+        a.copyFrom(mip2);
 
         return allocation;
     }
 
-    private Allocation loadTexture(int id, String name) {
-        final Allocation allocation = Allocation.createFromBitmapResource(mRS, mResources,
-                id, RGB_565(mRS), false);
-        allocation.setName(name);
-        return allocation;
+    private Allocation loadTexture(int id) {
+        return Allocation.createFromBitmapResource(mRS, mResources, id);
     }
 
     private void createProgramFragment() {
         Sampler.Builder samplerBuilder = new Sampler.Builder(mRS);
-        samplerBuilder.setMin(LINEAR_MIP_LINEAR);
-        samplerBuilder.setMag(LINEAR);
+        samplerBuilder.setMinification(LINEAR_MIP_LINEAR);
+        samplerBuilder.setMagnification(LINEAR);
         samplerBuilder.setWrapS(WRAP);
         samplerBuilder.setWrapT(WRAP);
         Sampler sl = samplerBuilder.create();
 
-        samplerBuilder.setMin(NEAREST);
-        samplerBuilder.setMag(NEAREST);
+        samplerBuilder.setMinification(NEAREST);
+        samplerBuilder.setMagnification(NEAREST);
         Sampler sn = samplerBuilder.create();
 
-        ProgramFragment.Builder builder = new ProgramFragment.Builder(mRS);
-        builder.setTexture(ProgramFragment.Builder.EnvMode.REPLACE,
-                           ProgramFragment.Builder.Format.ALPHA, 0);
-        mPfGrass = builder.create();
-        mPfGrass.setName("PFGrass");
-        mPfGrass.bindSampler(sl, 0);
+        ProgramFragmentFixedFunction.Builder builder = new ProgramFragmentFixedFunction.Builder(mRS);
+        builder.setTexture(ProgramFragmentFixedFunction.Builder.EnvMode.REPLACE,
+                           ProgramFragmentFixedFunction.Builder.Format.ALPHA, 0);
+        builder.setVaryingColor(true);
+        ProgramFragment pf = builder.create();
+        mScript.set_gPFGrass(pf);
+        pf.bindSampler(sl, 0);
 
-        builder = new ProgramFragment.Builder(mRS);
-        builder.setTexture(ProgramFragment.Builder.EnvMode.REPLACE,
-                           ProgramFragment.Builder.Format.RGB, 0);
-        mPfBackground = builder.create();
-        mPfBackground.setName("PFBackground");
-        mPfBackground.bindSampler(sn, 0);
+        builder = new ProgramFragmentFixedFunction.Builder(mRS);
+        builder.setTexture(ProgramFragmentFixedFunction.Builder.EnvMode.REPLACE,
+                           ProgramFragmentFixedFunction.Builder.Format.RGB, 0);
+        pf = builder.create();
+        mScript.set_gPFBackground(pf);
+        pf.bindSampler(sn, 0);
     }
 
     private void createProgramFragmentStore() {
-        ProgramStore.Builder builder = new ProgramStore.Builder(mRS, null, null);
+        ProgramStore.Builder builder = new ProgramStore.Builder(mRS);
         builder.setDepthFunc(ALWAYS);
         builder.setBlendFunc(BlendSrcFunc.SRC_ALPHA, BlendDstFunc.ONE_MINUS_SRC_ALPHA);
-        builder.setDitherEnable(false);
-        builder.setDepthMask(false);
-        mPfsBackground = builder.create();
-        mPfsBackground.setName("PFSBackground");
+        builder.setDitherEnabled(false);
+        builder.setDepthMaskEnabled(false);
+        mScript.set_gPSBackground(builder.create());
     }
 
     private void createProgramVertex() {
-        mPvOrthoAlloc = new ProgramVertex.MatrixAllocation(mRS);
-        mPvOrthoAlloc.setupOrthoWindow(mWidth, mHeight);
+        mPvOrthoAlloc = new ProgramVertexFixedFunction.Constants(mRS);
+        Matrix4f proj = new Matrix4f();
+        proj.loadOrthoWindow(mWidth, mHeight);
+        mPvOrthoAlloc.setProjection(proj);
 
-        ProgramVertex.Builder pvb = new ProgramVertex.Builder(mRS, null, null);
-        mPvBackground = pvb.create();
-        mPvBackground.bindAllocation(mPvOrthoAlloc);
-        mPvBackground.setName("PVBackground");
+        ProgramVertexFixedFunction.Builder pvb = new ProgramVertexFixedFunction.Builder(mRS);
+        ProgramVertex pv = pvb.create();
+        ((ProgramVertexFixedFunction)pv).bindConstants(mPvOrthoAlloc);
+        mScript.set_gPVBackground(pv);
     }
 
     private void updateLocation() {
@@ -441,26 +333,25 @@ class GrassRS extends RenderScriptScene {
     }
 
     private void updateLocation(Location location) {
+        float dawn = 0.3f;
+        float dusk = 0.75f;
+
         if (location != null) {
             final String timeZone = Time.getCurrentTimezone();
             final SunCalculator calculator = new SunCalculator(location, timeZone);
             final Calendar now = Calendar.getInstance();
 
             final double sunrise = calculator.computeSunriseTime(SunCalculator.ZENITH_CIVIL, now);
-            mWorldState.dawn = SunCalculator.timeToDayFraction(sunrise);
+            dawn = SunCalculator.timeToDayFraction(sunrise);
 
             final double sunset = calculator.computeSunsetTime(SunCalculator.ZENITH_CIVIL, now);
-            mWorldState.dusk = SunCalculator.timeToDayFraction(sunset);
-        } else {
-            mWorldState.dawn = 0.3f;
-            mWorldState.dusk = 0.75f;
+            dusk = SunCalculator.timeToDayFraction(sunset);
         }
 
-        mWorldState.morning = mWorldState.dawn + 1.0f / 12.0f; // 2 hours for sunrise
-        mWorldState.afternoon = mWorldState.dusk - 1.0f / 12.0f; // 2 hours for sunset
-
-        // Send the new data to RenderScript
-        mState.data(mWorldState);
+        mScript.set_gDawn(dawn);
+        mScript.set_gDusk(dusk);
+        mScript.set_gMorning(dawn + 1.0f / 12.0f); // 2 hours for sunrise
+        mScript.set_gAfternoon(dusk - 1.0f / 12.0f); // 2 hours for sunset
     }
 
     private class LocationUpdater implements LocationListener {

@@ -69,11 +69,11 @@ public abstract class RenderScriptScene {
     protected abstract ScriptC createScript();
 
     public void stop() {
-        mRS.contextBindRootScript(null);
+        mRS.bindRootScript(null);
     }
 
     public void start() {
-        mRS.contextBindRootScript(mScript);
+        mRS.bindRootScript(mScript);
     }
 
     public void resize(int width, int height) {

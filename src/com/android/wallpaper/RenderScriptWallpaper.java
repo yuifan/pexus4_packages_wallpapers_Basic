@@ -16,7 +16,6 @@
 
 package com.android.wallpaper;
 
-import android.graphics.PixelFormat;
 import android.service.wallpaper.WallpaperService;
 import android.os.Bundle;
 import android.renderscript.RenderScriptGL;
@@ -40,10 +39,6 @@ public abstract class RenderScriptWallpaper<T extends RenderScriptScene> extends
             super.onCreate(surfaceHolder);
             setTouchEventsEnabled(false);
             surfaceHolder.setSizeFromLayout();
-
-            if (getResources().getBoolean(R.bool.use_32bit)) {
-                surfaceHolder.setFormat(PixelFormat.RGBX_8888);
-            }
         }
 
         @Override
@@ -58,6 +53,7 @@ public abstract class RenderScriptWallpaper<T extends RenderScriptScene> extends
                 mRenderer = null;
             }
             if (mRs != null) {
+                mRs.setSurface(null, 0, 0);
                 mRs.destroy();
                 mRs = null;
             }
@@ -79,7 +75,7 @@ public abstract class RenderScriptWallpaper<T extends RenderScriptScene> extends
         public void onSurfaceChanged(SurfaceHolder holder, int format, int width, int height) {
             super.onSurfaceChanged(holder, format, width, height);
             if (mRs != null) {
-                mRs.contextSetSurface(width, height, holder.getSurface());
+                mRs.setSurface(holder, width, height);
             }
             if (mRenderer == null) {
                 mRenderer = createScene(width, height);
@@ -93,19 +89,16 @@ public abstract class RenderScriptWallpaper<T extends RenderScriptScene> extends
         @Override
         public void onOffsetsChanged(float xOffset, float yOffset,
                 float xStep, float yStep, int xPixels, int yPixels) {
-            mRenderer.setOffset(xOffset, yOffset, xPixels, yPixels);
+            if (mRenderer != null) mRenderer.setOffset(xOffset, yOffset, xPixels, yPixels);
         }
 
         @Override
         public void onSurfaceCreated(SurfaceHolder holder) {
             super.onSurfaceCreated(holder);
 
-            Surface surface = null;
-            while (surface == null) {
-                surface = holder.getSurface();
-            }
-            mRs = new RenderScriptGL(false, false);
-            mRs.contextSetPriority(RenderScript.Priority.LOW);
+            RenderScriptGL.SurfaceConfig sc = new RenderScriptGL.SurfaceConfig();
+            mRs = new RenderScriptGL(RenderScriptWallpaper.this, sc);
+            mRs.setPriority(RenderScript.Priority.LOW);
         }
 
         @Override
@@ -117,7 +110,11 @@ public abstract class RenderScriptWallpaper<T extends RenderScriptScene> extends
         @Override
         public Bundle onCommand(String action, int x, int y, int z,
                 Bundle extras, boolean resultRequested) {
-            return mRenderer.onCommand(action, x, y, z, extras, resultRequested);
+            if (mRenderer != null) {
+                return mRenderer.onCommand(action, x, y, z, extras, resultRequested);
+            } else {
+                return null;
+            }
         }
 
     }
